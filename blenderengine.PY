@@ -2,6 +2,33 @@ import bpy
 import array
 import gpu
 from gpu_extras.presets import draw_texture_2d
+from mathutils import Vector
+import numpy as np
+
+def corput(n, base):
+    # generate a Van der Corput sequence between -0.5 and 0.5
+    q, denom = 0, 1
+    while n:
+        denom *= base
+        n, remainder = divmod(n, base)
+        q += remainder / denom
+    return q - 0.5
+
+def ray_cast(scene, origin, direction):
+    return scene.ray_cast(scene.view_layers[0].depsgraph, origin, direction)
+
+def RT_trace_ray(scene, ray_orig, ray_dir):
+    # First, we cast a ray into the scene using Blender's built-in function
+    has_hit, hit_loc, hit_norm, _, hit_obj, _ = ray_cast(scene, ray_orig, ray_dir)
+
+    # set initial color (black) for the pixel
+    color = np.zeros(3)
+
+    # if the ray hits nothing in the scene
+    # return black
+    if not has_hit:
+        return color
+    return np.array([1, 0.0, 0.0])
 
 
 class CustomRenderEngine(bpy.types.RenderEngine):
@@ -31,82 +58,49 @@ class CustomRenderEngine(bpy.types.RenderEngine):
         self.size_x = int(scene.render.resolution_x * scale)
         self.size_y = int(scene.render.resolution_y * scale)
 
-        # Fill the render result with a flat color. The framebuffer is
-        # defined as a list of pixels, each pixel itself being a list of
-        # R,G,B,A values.
-        if self.is_preview:
-            color = [0.1, 0.2, 0.1, 1.0]
-        else:
-            color = [0.2, 0.1, 0.1, 1.0]
+        sample_count = 1
+        width = int(scene.render.resolution_x * scale)
+        height = int(scene.render.resolution_y * scale)
+
+        focal_length = scene.camera.data.lens / scene.camera.data.sensor_width
+        aspect_ratio = height / width
+        dx = 1 / width
+        dy = aspect_ratio / height
+        corput_x = [corput(i, 2) * dx for i in range(sample_count)]
+        corput_y = [corput(i, 3) * dy for i in range(sample_count)]
+        cam_location = scene.camera.location
+        cam_orientation = scene.camera.rotation_euler
+
+        color = [0, 0, 0, 1.0]
 
         pixel_count = self.size_x * self.size_y
         rect = [color] * pixel_count
 
+        max_x = -20
+        min_x = 20
+
+        for s in range(sample_count):
+            for y in range(self.size_y):
+                screen_y = ((y - (height / 2)) / height) * aspect_ratio
+                
+                for x in range(self.size_x):
+                    screen_x = (x - (width / 2)) / width
+
+                    ray_dir = Vector((screen_x + corput_x[s], screen_y + corput_y[s], -focal_length))
+                    ray_dir.rotate(cam_orientation)
+                    ray_dir = ray_dir.normalized()
+
+                    color = RT_trace_ray(scene, cam_location, ray_dir)
+
+                    # create a ray
+                    r, g, b = color[0], color[1], color[2]
+                    rect[y*self.size_x + x] = [r, g, b, 1.0]   
+                    
         # Here we write the pixel values to the RenderResult
         result = self.begin_result(0, 0, self.size_x, self.size_y)
         layer = result.layers[0].passes["Combined"]
         layer.rect = rect
         self.end_result(result)
-
-    # For viewport renders, this method gets called once at the start and
-    # whenever the scene or 3D viewport changes. This method is where data
-    # should be read from Blender in the same thread. Typically a render
-    # thread will be started to do the work while keeping Blender responsive.
-    def view_update(self, context, depsgraph):
-        region = context.region
-        view3d = context.space_data
-        scene = depsgraph.scene
-
-        # Get viewport dimensions
-        dimensions = region.width, region.height
-
-        if not self.scene_data:
-            # First time initialization
-            self.scene_data = []
-            first_time = True
-
-            # Loop over all datablocks used in the scene.
-            for datablock in depsgraph.ids:
-                pass
-        else:
-            first_time = False
-
-            # Test which datablocks changed
-            for update in depsgraph.updates:
-                print("Datablock updated: ", update.id.name)
-
-            # Test if any material was added, removed or changed.
-            if depsgraph.id_type_updated('MATERIAL'):
-                print("Materials updated")
-
-        # Loop over all object instances in the scene.
-        if first_time or depsgraph.id_type_updated('OBJECT'):
-            for instance in depsgraph.object_instances:
-                pass
-
-    # For viewport renders, this method is called whenever Blender redraws
-    # the 3D viewport. The renderer is expected to quickly draw the render
-    # with OpenGL, and not perform other expensive work.
-    # Blender will draw overlays for selection and editing on top of the
-    # rendered image automatically.
-    def view_draw(self, context, depsgraph):
-        region = context.region
-        scene = depsgraph.scene
-
-        # Get viewport dimensions
-        dimensions = region.width, region.height
-
-        # Bind shader that converts from scene linear to display space,
-        gpu.state.blend_set('ALPHA_PREMULT')
-        self.bind_display_space_shader(scene)
-
-        if not self.draw_data or self.draw_data.dimensions != dimensions:
-            self.draw_data = CustomDrawData(dimensions)
-
-        self.draw_data.draw()
-
-        self.unbind_display_space_shader()
-        gpu.state.blend_set('NONE')
 
 
 class CustomDrawData:
